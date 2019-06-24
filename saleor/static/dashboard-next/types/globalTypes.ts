@@ -42,6 +42,7 @@ export enum LanguageCodeEnum {
   DE = "DE",
   EN = "EN",
   ES = "ES",
+  ES_CO = "ES_CO",
   ET = "ET",
   FA = "FA",
   FR = "FR",
@@ -52,6 +53,7 @@ export enum LanguageCodeEnum {
   IT = "IT",
   JA = "JA",
   KO = "KO",
+  LT = "LT",
   MN = "MN",
   NB = "NB",
   NL = "NL",
@@ -61,6 +63,7 @@ export enum LanguageCodeEnum {
   RO = "RO",
   RU = "RU",
   SK = "SK",
+  SQ = "SQ",
   SR = "SR",
   SV = "SV",
   SW = "SW",
@@ -79,8 +82,20 @@ export enum OrderAction {
   VOID = "VOID",
 }
 
-export enum OrderEvents {
+export enum OrderEventsEmailsEnum {
+  DIGITAL_LINKS = "DIGITAL_LINKS",
+  FULFILLMENT_CONFIRMATION = "FULFILLMENT_CONFIRMATION",
+  ORDER_CONFIRMATION = "ORDER_CONFIRMATION",
+  PAYMENT_CONFIRMATION = "PAYMENT_CONFIRMATION",
+  SHIPPING_CONFIRMATION = "SHIPPING_CONFIRMATION",
+  TRACKING_UPDATED = "TRACKING_UPDATED",
+}
+
+export enum OrderEventsEnum {
   CANCELED = "CANCELED",
+  DRAFT_ADDED_PRODUCTS = "DRAFT_ADDED_PRODUCTS",
+  DRAFT_CREATED = "DRAFT_CREATED",
+  DRAFT_REMOVED_PRODUCTS = "DRAFT_REMOVED_PRODUCTS",
   EMAIL_SENT = "EMAIL_SENT",
   FULFILLMENT_CANCELED = "FULFILLMENT_CANCELED",
   FULFILLMENT_FULFILLED_ITEMS = "FULFILLMENT_FULFILLED_ITEMS",
@@ -91,19 +106,13 @@ export enum OrderEvents {
   OTHER = "OTHER",
   OVERSOLD_ITEMS = "OVERSOLD_ITEMS",
   PAYMENT_CAPTURED = "PAYMENT_CAPTURED",
+  PAYMENT_FAILED = "PAYMENT_FAILED",
   PAYMENT_REFUNDED = "PAYMENT_REFUNDED",
   PAYMENT_VOIDED = "PAYMENT_VOIDED",
   PLACED = "PLACED",
   PLACED_FROM_DRAFT = "PLACED_FROM_DRAFT",
   TRACKING_UPDATED = "TRACKING_UPDATED",
-  UPDATED = "UPDATED",
-}
-
-export enum OrderEventsEmails {
-  FULFILLMENT = "FULFILLMENT",
-  ORDER = "ORDER",
-  PAYMENT = "PAYMENT",
-  SHIPPING = "SHIPPING",
+  UPDATED_ADDRESS = "UPDATED_ADDRESS",
 }
 
 export enum OrderStatus {
@@ -115,8 +124,12 @@ export enum OrderStatus {
 }
 
 export enum OrderStatusFilter {
+  CANCELED = "CANCELED",
+  FULFILLED = "FULFILLED",
+  PARTIALLY_FULFILLED = "PARTIALLY_FULFILLED",
   READY_TO_CAPTURE = "READY_TO_CAPTURE",
   READY_TO_FULFILL = "READY_TO_FULFILL",
+  UNFULFILLED = "UNFULFILLED",
 }
 
 export enum PaymentChargeStatusEnum {
@@ -231,6 +244,11 @@ export interface AttributeCreateInput {
   values?: (AttributeValueCreateInput | null)[] | null;
 }
 
+export interface AttributeInput {
+  slug: string;
+  value: string;
+}
+
 export interface AttributeUpdateInput {
   name?: string | null;
   removeValues?: (string | null)[] | null;
@@ -303,6 +321,11 @@ export interface CustomerInput {
   note?: string | null;
 }
 
+export interface DateRangeInput {
+  gte?: any | null;
+  lte?: any | null;
+}
+
 export interface DraftOrderInput {
   billingAddress?: AddressInput | null;
   user?: string | null;
@@ -333,12 +356,48 @@ export interface FulfillmentUpdateTrackingInput {
   notifyCustomer?: boolean | null;
 }
 
+export interface MenuCreateInput {
+  name?: string | null;
+  items?: (MenuItemInput | null)[] | null;
+}
+
+export interface MenuItemCreateInput {
+  name?: string | null;
+  url?: string | null;
+  category?: string | null;
+  collection?: string | null;
+  page?: string | null;
+  menu: string;
+  parent?: string | null;
+}
+
+export interface MenuItemInput {
+  name?: string | null;
+  url?: string | null;
+  category?: string | null;
+  collection?: string | null;
+  page?: string | null;
+}
+
+export interface MenuItemMoveInput {
+  itemId: string;
+  parentId?: string | null;
+  sortOrder?: number | null;
+}
+
 export interface NameTranslationInput {
   name?: string | null;
 }
 
 export interface OrderAddNoteInput {
   message?: string | null;
+}
+
+export interface OrderFilterInput {
+  paymentStatus?: (PaymentChargeStatusEnum | null)[] | null;
+  status?: (OrderStatusFilter | null)[] | null;
+  customer?: string | null;
+  created?: DateRangeInput | null;
 }
 
 export interface OrderLineCreateInput {
@@ -376,6 +435,22 @@ export interface PageTranslationInput {
   title?: string | null;
   content?: string | null;
   contentJson?: any | null;
+}
+
+export interface PriceRangeInput {
+  gte?: number | null;
+  lte?: number | null;
+}
+
+export interface ProductFilterInput {
+  isPublished?: boolean | null;
+  collections?: (string | null)[] | null;
+  categories?: (string | null)[] | null;
+  price?: PriceRangeInput | null;
+  attributes?: (AttributeInput | null)[] | null;
+  stockAvailability?: StockAvailability | null;
+  productType?: string | null;
+  search?: string | null;
 }
 
 export interface ProductTypeInput {

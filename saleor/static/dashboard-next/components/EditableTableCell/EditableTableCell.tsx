@@ -12,11 +12,13 @@ import Typography from "@material-ui/core/Typography";
 import * as classNames from "classnames";
 import * as React from "react";
 
-import Form from "../../components/Form";
-import Toggle from "../../components/Toggle";
+import Form from "@saleor/components/Form";
 
 const styles = (theme: Theme) =>
   createStyles({
+    card: {
+      border: `1px solid ${theme.overrides.MuiCard.root.borderColor}`
+    },
     container: {
       position: "relative"
     },
@@ -63,56 +65,52 @@ export const EditableTableCell = withStyles(styles, {
     InputProps,
     value,
     onConfirm
-  }: EditableTableCellProps) => (
-    <TableCell className={classNames(classes.container, className)}>
-      <Toggle initial={focused}>
-        {(opened, { enable, disable }) => {
-          const handleConfirm = (data: { value: string }) => {
-            disable();
-            onConfirm(data.value);
-          };
-          return (
+  }: EditableTableCellProps) => {
+    const [opened, setOpenStatus] = React.useState(focused);
+    const enable = () => setOpenStatus(true);
+    const disable = () => setOpenStatus(false);
+
+    const handleConfirm = (data: { value: string }) => {
+      disable();
+      onConfirm(data.value);
+    };
+
+    return (
+      <TableCell className={classNames(classes.container, className)}>
+        {opened && <div className={classes.overlay} onClick={disable} />}
+        <Form initial={{ value }} onSubmit={handleConfirm} useForm={false}>
+          {({ change, data }) => (
             <>
-              {opened && <div className={classes.overlay} onClick={disable} />}
-              <Form
-                initial={{ value }}
-                onSubmit={handleConfirm}
-                useForm={false}
+              <Typography
+                variant="caption"
+                onClick={enable}
+                className={classes.text}
               >
-                {({ change, data }) => (
-                  <>
-                    <Typography
-                      variant="caption"
-                      onClick={enable}
-                      className={classes.text}
-                    >
-                      {value || defaultValue}
-                    </Typography>
-                    {opened && (
-                      <div className={classes.root}>
-                        <Card>
-                          <CardContent>
-                            <TextField
-                              name="value"
-                              autoFocus
-                              fullWidth
-                              onChange={change}
-                              value={data.value}
-                              {...InputProps}
-                            />
-                          </CardContent>
-                        </Card>
-                      </div>
-                    )}
-                  </>
-                )}
-              </Form>
+                {value || defaultValue}
+              </Typography>
+              {opened && (
+                <div className={classes.root}>
+                  <Card className={classes.card}>
+                    <CardContent>
+                      <TextField
+                        name="value"
+                        autoFocus
+                        fullWidth
+                        onChange={change}
+                        value={data.value}
+                        variant="standard"
+                        {...InputProps}
+                      />
+                    </CardContent>
+                  </Card>
+                </div>
+              )}
             </>
-          );
-        }}
-      </Toggle>
-    </TableCell>
-  )
+          )}
+        </Form>
+      </TableCell>
+    );
+  }
 );
 EditableTableCell.displayName = "EditableTableCell";
 export default EditableTableCell;
