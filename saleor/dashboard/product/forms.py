@@ -1,18 +1,17 @@
 import bleach
 from django import forms
 from django.conf import settings
-from django.db.models import Count, Q
+from django.db.models import Count
 from django.forms.models import ModelChoiceIterator
 from django.forms.widgets import CheckboxSelectMultiple
 from django.utils.encoding import smart_text
 from django.utils.text import slugify
 from django.utils.translation import pgettext_lazy
-from django_prices_vatlayer.utils import get_tax_rate_types
 from mptt.forms import TreeNodeChoiceField
 
-from ...core import TaxRateType
-from ...core.utils.taxes import DEFAULT_TAX_RATE_NAME, include_taxes_in_prices
+from ...core.taxes import include_taxes_in_prices
 from ...core.weight import WeightField
+from ...extensions.manager import get_extensions_manager
 from ...product.models import (
     Attribute,
     AttributeValue,
@@ -67,17 +66,6 @@ class ProductTypeSelectorForm(forms.Form):
     )
 
 
-def get_tax_rate_type_choices():
-    rate_types = get_tax_rate_types() + [DEFAULT_TAX_RATE_NAME]
-    translations = dict(TaxRateType.CHOICES)
-    choices = [
-        (rate_name, translations.get(rate_name, "---------"))
-        for rate_name in rate_types
-    ]
-    # sort choices alphabetically by translations
-    return sorted(choices, key=lambda x: x[1])
-
-
 class ProductTypeForm(forms.ModelForm):
     tax_rate = forms.ChoiceField(
         required=False, label=pgettext_lazy("Product type tax rate type", "Tax rate")
@@ -118,24 +106,20 @@ class ProductTypeForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields["tax_rate"].choices = get_tax_rate_type_choices()
-        unassigned_attrs_q = Q(
-            product_type__isnull=True, product_variant_type__isnull=True
-        )
+        manager = get_extensions_manager()
+        self.fields["tax_rate"].choices = [
+            (tax.code, tax.description) for tax in manager.get_tax_rate_type_choices()
+        ]
+        variant_attrs_qs = product_attrs_qs = Attribute.objects.all()
 
         if self.instance.pk:
-            product_attrs_qs = Attribute.objects.filter(
-                Q(product_type=self.instance) | unassigned_attrs_q
+            product_attrs_initial = (
+                self.instance.product_attributes.all().product_attributes_sorted()
             )
-            variant_attrs_qs = Attribute.objects.filter(
-                Q(product_variant_type=self.instance) | unassigned_attrs_q
+            variant_attrs_initial = (
+                self.instance.variant_attributes.all().variant_attributes_sorted()
             )
-            product_attrs_initial = self.instance.product_attributes.all()
-            variant_attrs_initial = self.instance.variant_attributes.all()
         else:
-            unassigned_attrs = Attribute.objects.filter(unassigned_attrs_q)
-            product_attrs_qs = unassigned_attrs
-            variant_attrs_qs = unassigned_attrs
             product_attrs_initial = []
             variant_attrs_initial = []
 
@@ -238,7 +222,7 @@ class AttributesMixin:
                         attribute_id=attr.pk, name=value, slug=slugify(value)
                     )
                     value.save()
-                attributes[smart_text(attr.pk)] = smart_text(value.pk)
+                attributes[smart_text(attr.pk)] = [smart_text(value.pk)]
         return attributes
 
 
@@ -287,11 +271,15 @@ class ProductForm(forms.ModelForm, AttributesMixin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        manager = get_extensions_manager()
         product_type = self.instance.product_type
-        self.initial["tax_rate"] = self.instance.tax_rate or product_type.tax_rate
+        product_tax_rate = manager.get_tax_code_from_object_meta(self.instance).code
+        self.initial["tax_rate"] = (
+            product_tax_rate or manager.get_tax_code_from_object_meta(product_type).code
+        )
         self.available_attributes = product_type.product_attributes.prefetch_related(
             "values"
-        ).all()
+        ).product_attributes_sorted()
         self.prepare_fields_for_attributes()
         self.fields["collections"].initial = Collection.objects.filter(
             products__name=self.instance
@@ -305,7 +293,9 @@ class ProductForm(forms.ModelForm, AttributesMixin):
         self.fields["seo_title"] = SeoTitleField(
             extra_attrs={"data-bind": self["name"].auto_id}
         )
-        self.fields["tax_rate"].choices = get_tax_rate_type_choices()
+        self.fields["tax_rate"].choices = [
+            (tax.code, tax.description) for tax in manager.get_tax_rate_type_choices()
+        ]
         if include_taxes_in_prices():
             self.fields["price"].label = pgettext_lazy(
                 "Currency gross amount", "Gross price"
@@ -385,8 +375,10 @@ class ProductVariantForm(forms.ModelForm, AttributesMixin):
             self.fields["price_override"].widget.attrs[
                 "placeholder"
             ] = self.instance.product.price.amount
-            qs = self.instance.product.product_type.variant_attributes.all()
-            self.available_attributes = qs.prefetch_related("values")
+            qs = self.instance.product.product_type.variant_attributes
+            self.available_attributes = qs.prefetch_related(
+                "values"
+            ).variant_attributes_sorted()
             self.prepare_fields_for_attributes()
 
         if include_taxes_in_prices():
@@ -498,7 +490,7 @@ class VariantImagesSelectForm(forms.Form):
 class AttributeForm(forms.ModelForm):
     class Meta:
         model = Attribute
-        exclude = []
+        exclude = ["input_type"]
         labels = {
             "name": pgettext_lazy("Product display name", "Display name"),
             "slug": pgettext_lazy("Product internal name", "Internal name"),

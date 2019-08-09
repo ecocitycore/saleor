@@ -1,13 +1,16 @@
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from django.conf import settings
+from graphql_jwt.decorators import permission_required
 
 from ...checkout import models
-from ...core.utils.taxes import get_taxes_for_address
+from ...checkout.utils import get_valid_shipping_methods_for_checkout
+from ...core.taxes import zero_taxed_money
 from ..core.connection import CountableDjangoObjectType
+from ..core.resolvers import resolve_meta, resolve_private_meta
+from ..core.types.meta import MetadataObjectType
 from ..core.types.money import TaxedMoney
 from ..giftcard.types import GiftCard
-from ..order.utils import applicable_shipping_methods
 from ..payment.enums import PaymentGatewayEnum
 from ..shipping.types import ShippingMethod
 
@@ -29,16 +32,17 @@ class CheckoutLine(CountableDjangoObjectType):
         filter_fields = ["id"]
 
     @staticmethod
-    def resolve_total_price(root: models.CheckoutLine, info):
-        taxes = get_taxes_for_address(root.checkout.shipping_address)
-        return root.get_total(discounts=info.context.discounts, taxes=taxes)
+    def resolve_total_price(self, info):
+        return info.context.extensions.calculate_checkout_line_total(
+            checkout_line=self, discounts=info.context.discounts
+        )
 
     @staticmethod
     def resolve_requires_shipping(root: models.CheckoutLine, *_args):
         return root.is_shipping_required()
 
 
-class Checkout(CountableDjangoObjectType):
+class Checkout(MetadataObjectType, CountableDjangoObjectType):
     available_shipping_methods = graphene.List(
         ShippingMethod,
         required=True,
@@ -109,19 +113,30 @@ class Checkout(CountableDjangoObjectType):
         filter_fields = ["token"]
 
     @staticmethod
+    def resolve_email(root: models.Checkout, info):
+        return root.get_customer_email()
+
+    @staticmethod
     def resolve_total_price(root: models.Checkout, info):
-        taxes = get_taxes_for_address(root.shipping_address)
-        return root.get_total(discounts=info.context.discounts, taxes=taxes)
+        taxed_total = (
+            info.context.extensions.calculate_checkout_total(
+                checkout=root, discounts=info.context.discounts
+            )
+            - root.get_total_gift_cards_balance()
+        )
+        return max(taxed_total, zero_taxed_money())
 
     @staticmethod
     def resolve_subtotal_price(root: models.Checkout, info):
-        taxes = get_taxes_for_address(root.shipping_address)
-        return root.get_subtotal(discounts=info.context.discounts, taxes=taxes)
+        return info.context.extensions.calculate_checkout_subtotal(
+            checkout=root, discounts=info.context.discounts
+        )
 
     @staticmethod
-    def resolve_shipping_price(root: models.Checkout, *_args):
-        taxes = get_taxes_for_address(root.shipping_address)
-        return root.get_shipping_price(taxes=taxes)
+    def resolve_shipping_price(root: models.Checkout, info):
+        return info.context.extensions.calculate_checkout_shipping(
+            checkout=root, discounts=info.context.discounts
+        )
 
     @staticmethod
     def resolve_lines(root: models.Checkout, *_args):
@@ -129,9 +144,12 @@ class Checkout(CountableDjangoObjectType):
 
     @staticmethod
     def resolve_available_shipping_methods(root: models.Checkout, info):
-        taxes = get_taxes_for_address(root.shipping_address)
-        price = root.get_subtotal(taxes=taxes, discounts=info.context.discounts)
-        return applicable_shipping_methods(root, price.gross.amount)
+        available = get_valid_shipping_methods_for_checkout(
+            root, info.context.discounts
+        )
+        if available is None:
+            return []
+        return available
 
     @staticmethod
     def resolve_available_payment_gateways(_: models.Checkout, _info):
@@ -144,3 +162,12 @@ class Checkout(CountableDjangoObjectType):
     @staticmethod
     def resolve_is_shipping_required(root: models.Checkout, _info):
         return root.is_shipping_required()
+
+    @staticmethod
+    @permission_required("order.manage_orders")
+    def resolve_private_meta(root, _info):
+        return resolve_private_meta(root, _info)
+
+    @staticmethod
+    def resolve_meta(root, _info):
+        return resolve_meta(root, _info)

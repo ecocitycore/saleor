@@ -21,23 +21,14 @@ def get_redirect_location(response):
 def filter_products_by_attribute(queryset, attribute_id, value):
     key = smart_text(attribute_id)
     value = smart_text(value)
-    in_product = Q(attributes__contains={key: value})
-    in_variant = Q(variants__attributes__contains={key: value})
+    in_product = Q(**{f"attributes__from_key_{key}__has_key": value})
+    in_variant = Q(**{f"variants__attributes__from_key_{key}__has_key": value})
     return queryset.filter(in_product | in_variant)
 
 
 def get_form_errors(response, form_name="form"):
     errors = response.context.get(form_name).errors
     return errors.get("__all__") if errors else []
-
-
-def compare_taxes(taxes_1, taxes_2):
-    assert len(taxes_1) == len(taxes_2)
-
-    for rate_name, tax in taxes_1.items():
-        value_1 = tax["value"]
-        value_2 = taxes_2.get(rate_name)["value"]
-        assert value_1 == value_2
 
 
 def create_image(image_name="product2"):

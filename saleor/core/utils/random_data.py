@@ -1,4 +1,4 @@
-import datetime
+import itertools
 import json
 import os
 import random
@@ -10,7 +10,7 @@ from unittest.mock import patch
 from django.conf import settings
 from django.contrib.sites.models import Site
 from django.core.files import File
-from django_countries.fields import Country
+from django.utils import timezone
 from faker import Factory
 from faker.providers import BaseProvider
 from measurement.measures import Weight
@@ -20,15 +20,15 @@ from ...account.models import Address, User
 from ...account.utils import store_user_address
 from ...checkout import AddressType
 from ...core.utils.json_serializer import object_hook
-from ...core.utils.taxes import get_tax_rate_by_name, get_taxes_for_country
 from ...core.weight import zero_weight
-from ...dashboard.menu.utils import update_menu
 from ...discount import DiscountValueType, VoucherType
 from ...discount.models import Sale, Voucher
 from ...discount.utils import fetch_discounts
+from ...extensions.manager import get_extensions_manager
 from ...giftcard.models import GiftCard
 from ...menu.models import Menu
-from ...order.models import Fulfillment, Order
+from ...menu.utils import update_menu
+from ...order.models import Fulfillment, Order, OrderLine
 from ...order.utils import update_order_status
 from ...page.models import Page
 from ...payment.utils import (
@@ -54,7 +54,6 @@ from ...product.thumbnails import (
     create_product_thumbnails,
 )
 from ...shipping.models import ShippingMethod, ShippingMethodType, ShippingZone
-from ...shipping.utils import get_taxed_shipping_price
 
 fake = Factory.create()
 
@@ -166,9 +165,15 @@ def create_attributes(attributes_data):
     for attribute in attributes_data:
         pk = attribute["pk"]
         defaults = attribute["fields"]
-        defaults["product_type_id"] = defaults.pop("product_type")
-        defaults["product_variant_type_id"] = defaults.pop("product_variant_type")
-        Attribute.objects.update_or_create(pk=pk, defaults=defaults)
+        product_type_id = defaults.pop("product_type")
+        product_variant_type_id = defaults.pop("product_variant_type")
+        attr, _ = Attribute.objects.update_or_create(pk=pk, defaults=defaults)
+
+        if product_type_id:
+            attr.product_types.add(product_type_id)
+
+        if product_variant_type_id:
+            attr.product_variant_types.add(product_variant_type_id)
 
 
 def create_attributes_values(values_data):
@@ -294,7 +299,7 @@ def create_address():
         street_address_1=fake.street_address(),
         city=fake.city(),
         postal_code=fake.postcode(),
-        country=fake.country_code(),
+        country=settings.DEFAULT_COUNTRY,
     )
     return address
 
@@ -350,27 +355,45 @@ def create_fake_payment(mock_email_confirmation, order):
     return payment
 
 
-def create_order_line(order, discounts, taxes):
-    product = Product.objects.filter(variants__isnull=False).order_by("?")[0]
-    variant = product.variants.all()[0]
-    quantity = random.randrange(1, 5)
-    variant.quantity += quantity
-    variant.quantity_allocated += quantity
-    variant.save()
-    return order.lines.create(
-        product_name=variant.display_product(),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=quantity,
-        variant=variant,
-        unit_price=variant.get_price(discounts=discounts, taxes=taxes),
-        tax_rate=get_tax_rate_by_name(variant.product.tax_rate, taxes),
+def create_order_lines(order, discounts, how_many=10):
+    variants = (
+        ProductVariant.objects.filter()
+        .order_by("?")
+        .prefetch_related("product__product_type")[:how_many]
     )
-
-
-def create_order_lines(order, discounts, taxes, how_many=10):
+    variants_iter = itertools.cycle(variants)
+    lines = []
     for dummy in range(how_many):
-        yield create_order_line(order, discounts, taxes)
+        variant = next(variants_iter)
+        quantity = random.randrange(1, 5)
+        variant.quantity += quantity
+        variant.quantity_allocated += quantity
+        unit_price = variant.get_price(discounts)
+        lines.append(
+            OrderLine(
+                order=order,
+                product_name=variant.display_product(),
+                product_sku=variant.sku,
+                is_shipping_required=variant.is_shipping_required(),
+                quantity=quantity,
+                variant=variant,
+                unit_price_net=unit_price,
+                unit_price_gross=unit_price,
+                tax_rate=0,
+            )
+        )
+    ProductVariant.objects.bulk_update(variants, ["quantity", "quantity_allocated"])
+    lines = OrderLine.objects.bulk_create(lines)
+    manager = get_extensions_manager()
+    for line in lines:
+        unit_price = manager.calculate_order_line_unit(line)
+        line.unit_price_net = unit_price.net
+        line.unit_price_gross = unit_price.gross
+        line.tax_rate = unit_price.tax / unit_price.net
+    OrderLine.objects.bulk_update(
+        lines, ["unit_price_net", "unit_price_gross", "tax_rate"]
+    )
+    return lines
 
 
 def create_fulfillments(order):
@@ -385,15 +408,16 @@ def create_fulfillments(order):
     update_order_status(order)
 
 
-def create_fake_order(discounts, taxes):
+def create_fake_order(discounts, max_order_lines=5):
     user = random.choice(
         [None, User.objects.filter(is_superuser=False).order_by("?").first()]
     )
     if user:
+        address = user.default_shipping_address
         order_data = {
             "user": user,
             "billing_address": user.default_billing_address,
-            "shipping_address": user.default_shipping_address,
+            "shipping_address": address,
         }
     else:
         address = create_address()
@@ -403,18 +427,18 @@ def create_fake_order(discounts, taxes):
             "user_email": get_email(address.first_name, address.last_name),
         }
 
+    manager = get_extensions_manager()
     shipping_method = ShippingMethod.objects.order_by("?").first()
     shipping_price = shipping_method.price
-    shipping_price = get_taxed_shipping_price(shipping_price, taxes)
+    shipping_price = manager.apply_taxes_to_shipping(shipping_price, address)
     order_data.update(
         {"shipping_method_name": shipping_method.name, "shipping_price": shipping_price}
     )
 
     order = Order.objects.create(**order_data)
 
-    lines = create_order_lines(order, discounts, taxes, random.randrange(1, 5))
-
-    order.total = sum([line.get_total() for line in lines], order.shipping_price)
+    lines = create_order_lines(order, discounts, random.randrange(1, max_order_lines))
+    order.total = sum([line.get_total() for line in lines], shipping_price)
     weight = Weight(kg=0)
     for line in order:
         weight += line.variant.get_weight()
@@ -444,10 +468,9 @@ def create_users(how_many=10):
 
 
 def create_orders(how_many=10):
-    taxes = get_taxes_for_country(Country(settings.DEFAULT_COUNTRY))
-    discounts = fetch_discounts(datetime.date.today())
-    for dummy in range(how_many):
-        order = create_fake_order(discounts, taxes)
+    discounts = fetch_discounts(timezone.now())
+    for _ in range(how_many):
+        order = create_fake_order(discounts)
         yield "Order: %s" % (order,)
 
 
@@ -792,7 +815,7 @@ def create_vouchers():
     voucher, created = Voucher.objects.get_or_create(
         code="DISCOUNT",
         defaults={
-            "type": VoucherType.VALUE,
+            "type": VoucherType.ENTIRE_ORDER,
             "name": "Big order discount",
             "discount_value_type": DiscountValueType.FIXED,
             "discount_value": 25,
@@ -913,7 +936,7 @@ def create_page():
         ],
         "entityMap": {
             "0": {
-                "data": {"href": "https://github.com/mirumee/saleor"},
+                "data": {"url": "https://github.com/mirumee/saleor"},
                 "type": "LINK",
                 "mutability": "MUTABLE",
             }
@@ -925,7 +948,7 @@ def create_page():
         "title": "About",
         "is_published": True,
     }
-    page, dummy = Page.objects.get_or_create(slug="about", **page_data)
+    page, dummy = Page.objects.get_or_create(slug="about", defaults=page_data)
     yield "Page %s created" % page.slug
 
 

@@ -16,8 +16,8 @@ from measurement.measures import Weight
 from prices import Money
 
 from ..account.models import Address
+from ..core.taxes import zero_money, zero_taxed_money
 from ..core.utils.json_serializer import CustomJsonEncoder
-from ..core.utils.taxes import ZERO_TAXED_MONEY, zero_money
 from ..core.weight import WeightUnits, zero_weight
 from ..discount.models import Voucher
 from ..giftcard.models import GiftCard
@@ -165,7 +165,7 @@ class Order(models.Model):
         total_paid = self._total_paid()
         return total_paid.gross.amount > 0
 
-    def get_user_current_email(self):
+    def get_customer_email(self):
         return self.user.email if self.user else self.user_email
 
     def _total_paid(self):
@@ -179,7 +179,7 @@ class Order(models.Model):
             ]
         )
         total_captured = [payment.get_captured_amount() for payment in payments]
-        total_paid = sum(total_captured, ZERO_TAXED_MONEY)
+        total_paid = sum(total_captured, zero_taxed_money())
         return total_paid
 
     def _index_billing_phone(self):
@@ -233,7 +233,7 @@ class Order(models.Model):
 
     def get_subtotal(self):
         subtotal_iterator = (line.get_total() for line in self)
-        return sum(subtotal_iterator, ZERO_TAXED_MONEY)
+        return sum(subtotal_iterator, zero_taxed_money())
 
     def get_total_quantity(self):
         return sum([line.quantity for line in self])
@@ -309,13 +309,13 @@ class Order(models.Model):
 
 class OrderLineQueryset(models.QuerySet):
     def digital(self):
-        """Returns lines with digital products"""
+        """Return lines with digital products."""
         for line in self.all():
             if line.is_digital:
                 yield line
 
     def physical(self):
-        """Returns lines with physical products"""
+        """Return lines with physical products."""
         for line in self.all():
             if not line.is_digital:
                 yield line
@@ -375,8 +375,7 @@ class OrderLine(models.Model):
 
     @property
     def is_digital(self) -> bool:
-        """Return true if product variant is a digital type and has assigned
-        digital content"""
+        """Check if a variant is digital and contains digital content."""
         is_digital = self.variant.is_digital()
         has_digital = hasattr(self.variant, "digital_content")
         return is_digital and has_digital
@@ -437,6 +436,7 @@ class OrderEvent(models.Model):
     Args:
         parameters: Values needed to display the event on the storefront
         type: Type of an order
+
     """
 
     date = models.DateTimeField(default=now, editable=False)

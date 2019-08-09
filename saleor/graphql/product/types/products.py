@@ -1,3 +1,6 @@
+from collections import OrderedDict
+from typing import Dict
+
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from django.db.models import Prefetch
@@ -18,8 +21,17 @@ from ....product.utils.availability import (
 from ....product.utils.costs import get_margin_for_variant, get_product_costs_data
 from ...core.connection import CountableDjangoObjectType
 from ...core.enums import ReportingPeriod, TaxRateType
-from ...core.fields import PrefetchingConnectionField
-from ...core.types import Image, Money, MoneyRange, TaxedMoney, TaxedMoneyRange
+from ...core.fields import FilterInputConnectionField, PrefetchingConnectionField
+from ...core.resolvers import resolve_meta, resolve_private_meta
+from ...core.types import (
+    Image,
+    MetadataObjectType,
+    Money,
+    MoneyRange,
+    TaxedMoney,
+    TaxedMoneyRange,
+    TaxType,
+)
 from ...translations.enums import LanguageCodeEnum
 from ...translations.resolvers import resolve_translation
 from ...translations.types import (
@@ -30,12 +42,15 @@ from ...translations.types import (
 )
 from ...utils import get_database_id, reporting_period_to_date
 from ..enums import OrderDirection, ProductOrderField
+from ..filters import AttributeFilterInput
+from ..resolvers import resolve_attributes
 from .attributes import Attribute, SelectedAttribute
 from .digital_contents import DigitalContent
 
 
 def prefetch_products(info, *_args, **_kwargs):
     """Prefetch products visible to the current user.
+
     Can be used with models that have the `products` relationship. The queryset
     of products being prefetched is filtered based on permissions of the
     requesting user, to restrict access to unpublished products from non-staff
@@ -60,27 +75,30 @@ def prefetch_products_collection_sorted(info, *_args, **_kwargs):
     )
 
 
-def resolve_attribute_list(attributes_hstore, attributes_qs):
+def resolve_attribute_list(attributes_json, attributes_qs):
     """Resolve attributes dict into a list of `SelectedAttribute`s.
+
     keys = list(attributes.keys())
     values = list(attributes.values())
 
     `attributes_qs` is the queryset of attribute objects. If it's prefetch
     beforehand along with the values, it saves database queries.
     """
-    attributes_map = {}
-    values_map = {}
+    attributes_map = OrderedDict()  # type: Dict[str, models.Attribute]
+    values_map = {}  # type: Dict[str, models.AttributeValue]
     for attr in attributes_qs:
-        attributes_map[attr.pk] = attr
+        attributes_map[str(attr.pk)] = attr
         for val in attr.values.all():
-            values_map[val.pk] = val
+            values_map[str(val.pk)] = val
 
     attributes_list = []
-    for k, v in attributes_hstore.items():
-        attribute = attributes_map.get(int(k))
-        value = values_map.get(int(v))
-        if attribute and value:
-            attributes_list.append(SelectedAttribute(attribute=attribute, value=value))
+    for attr_pk, attr in attributes_map.items():
+        values = attributes_json.get(attr_pk, [])
+        values = [values_map[v_pk] for v_pk in values if v_pk in values_map]
+        value = values[0] if values else None
+        attributes_list.append(
+            SelectedAttribute(attribute=attr, value=value, values=values)
+        )
     return attributes_list
 
 
@@ -157,7 +175,7 @@ class ProductPricingInfo(BasePricingInfo):
         description = "Represents availability of a product in the storefront."
 
 
-class ProductVariant(CountableDjangoObjectType):
+class ProductVariant(CountableDjangoObjectType, MetadataObjectType):
     stock_quantity = graphene.Int(
         required=True, description="Quantity of a product available for sale."
     )
@@ -189,10 +207,12 @@ class ProductVariant(CountableDjangoObjectType):
     is_available = graphene.Boolean(
         description="Whether the variant is in stock and visible or not."
     )
-    attributes = graphene.List(
-        graphene.NonNull(SelectedAttribute),
-        required=True,
-        description="List of attributes assigned to this variant.",
+    attributes = gql_optimizer.field(
+        graphene.List(
+            graphene.NonNull(SelectedAttribute),
+            required=True,
+            description="List of attributes assigned to this variant.",
+        )
     )
     cost_price = graphene.Field(Money, description="Cost price of the variant.")
     margin = graphene.Int(description="Gross margin percentage value.")
@@ -256,12 +276,15 @@ class ProductVariant(CountableDjangoObjectType):
         return root.quantity_available
 
     @staticmethod
-    @gql_optimizer.resolver_hints(
-        prefetch_related="product__product_type__variant_attributes__values"
-    )
-    def resolve_attributes(root: models.ProductVariant, *_args):
-        attributes_qs = root.product.product_type.variant_attributes.all()
-        return resolve_attribute_list(root.attributes, attributes_qs)
+    @gql_optimizer.resolver_hints("product__product_type__variant_attributes__values")
+    def resolve_attributes(root: models.ProductVariant, info):
+        attr_qs = (
+            root.product.product_type.variant_attributes.prefetch_related("values")
+            .get_visible_to_user(info.context.user)
+            .variant_attributes_sorted()
+        )
+        attr_qs = gql_optimizer.query(attr_qs, info)
+        return resolve_attribute_list(root.attributes, attr_qs)
 
     @staticmethod
     @permission_required("product.manage_products")
@@ -283,7 +306,11 @@ class ProductVariant(CountableDjangoObjectType):
     def resolve_pricing(root: models.ProductVariant, info):
         context = info.context
         availability = get_variant_availability(
-            root, context.discounts, context.taxes, context.currency
+            root,
+            context.discounts,
+            context.country,
+            context.currency,
+            extensions=context.extensions,
         )
         return VariantPricingInfo(**availability._asdict())
 
@@ -334,8 +361,17 @@ class ProductVariant(CountableDjangoObjectType):
         qs = cls._meta.model.objects.filter(product__id__in=visible_products)
         return cls.maybe_optimize(info, qs, id)
 
+    @staticmethod
+    @permission_required("product.manage_products")
+    def resolve_private_meta(root, _info):
+        return resolve_private_meta(root, _info)
 
-class Product(CountableDjangoObjectType):
+    @staticmethod
+    def resolve_meta(root, _info):
+        return resolve_meta(root, _info)
+
+
+class Product(CountableDjangoObjectType, MetadataObjectType):
     url = graphene.String(
         description="The storefront URL for the product.", required=True
     )
@@ -372,7 +408,16 @@ class Product(CountableDjangoObjectType):
         description="The product's default base price.",
         deprecation_reason=("Has been replaced by 'basePrice'"),
     )
-    tax_rate = TaxRateType(description="A type of tax rate.")
+    tax_rate = TaxRateType(
+        description="A type of tax rate.",
+        deprecation_reason=(
+            "taxRate is deprecated. Use taxType to obtain taxCode for given tax gateway"
+        ),
+    )
+
+    tax_type = graphene.Field(
+        TaxType, description="A type of tax. Assigned by enabled tax gateway"
+    )
     attributes = graphene.List(
         graphene.NonNull(SelectedAttribute),
         required=True,
@@ -415,6 +460,8 @@ class Product(CountableDjangoObjectType):
         resolver=resolve_translation,
     )
 
+    slug = graphene.String(required=True, description="The slug of a product.")
+
     class Meta:
         description = """Represents an individual item for sale in the
         storefront."""
@@ -435,6 +482,19 @@ class Product(CountableDjangoObjectType):
             "updated_at",
             "weight",
         ]
+
+    @staticmethod
+    def resolve_tax_rate(root: models.Product, _info, **_kwargs):
+        # FIXME this resolver should be dropped after we drop tax_rate from API
+        if not hasattr(root, "meta"):
+            return None
+        tax = root.meta.get("taxes", {}).get("vatlayer", {})
+        return tax.get("code")
+
+    @staticmethod
+    def resolve_tax_type(root: models.Product, info):
+        tax_data = info.context.extensions.get_tax_code_from_object_meta(root)
+        return TaxType(tax_code=tax_data.code, description=tax_data.description)
 
     @staticmethod
     @gql_optimizer.resolver_hints(prefetch_related="images")
@@ -464,12 +524,16 @@ class Product(CountableDjangoObjectType):
     @staticmethod
     @gql_optimizer.resolver_hints(
         prefetch_related=("variants", "collections"),
-        only=["publication_date", "charge_taxes", "price", "tax_rate"],
+        only=["publication_date", "charge_taxes", "price", "meta"],
     )
     def resolve_pricing(root: models.Product, info):
         context = info.context
         availability = get_product_availability(
-            root, context.discounts, context.taxes, context.currency
+            root,
+            context.discounts,
+            context.country,
+            context.currency,
+            context.extensions,
         )
         return ProductPricingInfo(**availability._asdict())
 
@@ -487,19 +551,27 @@ class Product(CountableDjangoObjectType):
     @staticmethod
     @gql_optimizer.resolver_hints(
         prefetch_related=("variants", "collections"),
-        only=["publication_date", "charge_taxes", "price", "tax_rate"],
+        only=["publication_date", "charge_taxes", "price", "meta"],
     )
     def resolve_price(root: models.Product, info):
         price_range = root.get_price_range(info.context.discounts)
-        return price_range.start.net
+        price = info.context.extensions.apply_taxes_to_product(
+            root, price_range.start, info.context.country
+        )
+        return price.net
 
     @staticmethod
     @gql_optimizer.resolver_hints(
         prefetch_related="product_type__product_attributes__values"
     )
-    def resolve_attributes(root: models.Product, *_args):
-        attributes_qs = root.product_type.product_attributes.all()
-        return resolve_attribute_list(root.attributes, attributes_qs)
+    def resolve_attributes(root: models.Product, info):
+        attr_qs = (
+            root.product_type.product_attributes.prefetch_related("values")
+            .get_visible_to_user(info.context.user)
+            .product_attributes_sorted()
+        )
+        attr_qs = gql_optimizer.query(attr_qs, info)
+        return resolve_attribute_list(root.attributes, attr_qs)
 
     @staticmethod
     @permission_required("product.manage_products")
@@ -545,8 +617,21 @@ class Product(CountableDjangoObjectType):
             return cls.maybe_optimize(info, qs, pk)
         return None
 
+    @staticmethod
+    @permission_required("product.manage_products")
+    def resolve_private_meta(root, _info):
+        return resolve_private_meta(root, _info)
 
-class ProductType(CountableDjangoObjectType):
+    @staticmethod
+    def resolve_meta(root, _info):
+        return resolve_meta(root, _info)
+
+    @staticmethod
+    def resolve_slug(root: models.Product, *_args):
+        return root.get_slug()
+
+
+class ProductType(CountableDjangoObjectType, MetadataObjectType):
     products = gql_optimizer.field(
         PrefetchingConnectionField(
             Product, description="List of products of this type."
@@ -554,11 +639,17 @@ class ProductType(CountableDjangoObjectType):
         prefetch_related=prefetch_products,
     )
     tax_rate = TaxRateType(description="A type of tax rate.")
+    tax_type = graphene.Field(
+        TaxType, description="A type of tax. Assigned by enabled tax gateway"
+    )
     variant_attributes = graphene.List(
         Attribute, description="Variant attributes of that product type."
     )
     product_attributes = graphene.List(
         Attribute, description="Product attributes of that product type."
+    )
+    available_attributes = gql_optimizer.field(
+        FilterInputConnectionField(Attribute, filter=AttributeFilterInput())
     )
 
     class Meta:
@@ -573,17 +664,35 @@ class ProductType(CountableDjangoObjectType):
             "is_shipping_required",
             "name",
             "weight",
+            "tax_type",
         ]
 
     @staticmethod
-    @gql_optimizer.resolver_hints(prefetch_related="product_attributes")
-    def resolve_product_attributes(root: models.ProductType, *_args, **_kwargs):
-        return root.product_attributes.all()
+    def resolve_tax_type(root: models.ProductType, info):
+        tax_data = info.context.extensions.get_tax_code_from_object_meta(root)
+        return TaxType(tax_code=tax_data.code, description=tax_data.description)
 
     @staticmethod
-    @gql_optimizer.resolver_hints(prefetch_related="variant_attributes")
+    def resolve_tax_rate(root: models.ProductType, info, **_kwargs):
+        # FIXME this resolver should be dropped after we drop tax_rate from API
+        if not hasattr(root, "meta"):
+            return None
+        tax = root.meta.get("taxes", {}).get("vatlayer", {})
+        return tax.get("code")
+
+    @staticmethod
+    @gql_optimizer.resolver_hints(
+        prefetch_related="product_attributes__attributeproduct"
+    )
+    def resolve_product_attributes(root: models.ProductType, *_args, **_kwargs):
+        return root.product_attributes.product_attributes_sorted().all()
+
+    @staticmethod
+    @gql_optimizer.resolver_hints(
+        prefetch_related="variant_attributes__attributevariant"
+    )
     def resolve_variant_attributes(root: models.ProductType, *_args, **_kwargs):
-        return root.variant_attributes.all()
+        return root.variant_attributes.variant_attributes_sorted().all()
 
     @staticmethod
     def resolve_products(root: models.ProductType, info, **_kwargs):
@@ -592,8 +701,23 @@ class ProductType(CountableDjangoObjectType):
         qs = root.products.visible_to_user(info.context.user)
         return gql_optimizer.query(qs, info)
 
+    @staticmethod
+    @permission_required("product.manage_products")
+    def resolve_available_attributes(root: models.ProductType, info, **kwargs):
+        qs = models.Attribute.objects.get_unassigned_attributes(root.pk)
+        return resolve_attributes(info, qs=qs, **kwargs)
 
-class Collection(CountableDjangoObjectType):
+    @staticmethod
+    @permission_required("account.manage_products")
+    def resolve_private_meta(root, _info):
+        return resolve_private_meta(root, _info)
+
+    @staticmethod
+    def resolve_meta(root, _info):
+        return resolve_meta(root, _info)
+
+
+class Collection(CountableDjangoObjectType, MetadataObjectType):
     products = gql_optimizer.field(
         PrefetchingConnectionField(
             Product, description="List of products in this collection."
@@ -665,8 +789,17 @@ class Collection(CountableDjangoObjectType):
             return cls.maybe_optimize(info, qs, id)
         return None
 
+    @staticmethod
+    @permission_required("product.manage_products")
+    def resolve_private_meta(root, _info):
+        return resolve_private_meta(root, _info)
 
-class Category(CountableDjangoObjectType):
+    @staticmethod
+    def resolve_meta(root, _info):
+        return resolve_meta(root, _info)
+
+
+class Category(CountableDjangoObjectType, MetadataObjectType):
     ancestors = PrefetchingConnectionField(
         lambda: Category, description="List of ancestors of the category."
     )
@@ -750,6 +883,15 @@ class Category(CountableDjangoObjectType):
         qs = models.Product.objects.published()
         qs = qs.filter(category__in=tree)
         return gql_optimizer.query(qs, info)
+
+    @staticmethod
+    @permission_required("product.manage_products")
+    def resolve_private_meta(root, _info):
+        return resolve_private_meta(root, _info)
+
+    @staticmethod
+    def resolve_meta(root, _info):
+        return resolve_meta(root, _info)
 
 
 class ProductImage(CountableDjangoObjectType):

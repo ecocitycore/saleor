@@ -8,14 +8,14 @@ from prices import Money, TaxedMoney
 
 from ..account.utils import store_user_address
 from ..checkout import AddressType
-from ..core.utils.taxes import ZERO_MONEY, get_tax_rate_by_name, get_taxes_for_address
+from ..core.taxes import zero_money
 from ..core.weight import zero_weight
 from ..dashboard.order.utils import get_voucher_discount_for_order
 from ..discount.models import NotApplicable
+from ..extensions.manager import get_extensions_manager
 from ..order import FulfillmentStatus, OrderStatus, emails
 from ..order.models import Fulfillment, FulfillmentLine, Order, OrderLine
 from ..payment import ChargeStatus
-from ..payment.utils import gateway_refund, gateway_void
 from ..product.utils import (
     allocate_stock,
     deallocate_stock,
@@ -23,11 +23,12 @@ from ..product.utils import (
     increase_stock,
 )
 from ..product.utils.digital_products import get_default_digital_content_settings
+from ..shipping.models import ShippingMethod
 from . import events
 
 
 def order_line_needs_automatic_fulfillment(line: OrderLine) -> bool:
-    """Check if given line is digital and should be automatically fulfilled"""
+    """Check if given line is digital and should be automatically fulfilled."""
     digital_content_settings = get_default_digital_content_settings()
     default_automatic_fulfillment = digital_content_settings["automatic_fulfillment"]
     content = line.variant.digital_content
@@ -39,8 +40,7 @@ def order_line_needs_automatic_fulfillment(line: OrderLine) -> bool:
 
 
 def order_needs_automatic_fullfilment(order: Order) -> bool:
-    """Check if order has digital products which should be automatically
-    fulfilled"""
+    """Check if order has digital products which should be automatically fulfilled."""
     for line in order.lines.digital():
         if order_line_needs_automatic_fulfillment(line):
             return True
@@ -56,8 +56,10 @@ def fulfill_order_line(order_line, quantity):
 
 
 def automatically_fulfill_digital_lines(order: Order):
-    """Fulfill all digital lines which have enabled automatic fulfillment
-    setting and send confirmation email."""
+    """Fulfill all digital lines which have enabled automatic fulfillment setting.
+
+    Send confirmation email afterward.
+    """
     digital_lines = order.lines.filter(
         is_shipping_required=False, variant__digital_content__isnull=False
     )
@@ -111,7 +113,7 @@ def update_voucher_discount(func):
             try:
                 discount_amount = get_voucher_discount_for_order(order)
             except NotApplicable:
-                discount_amount = ZERO_MONEY
+                discount_amount = zero_money()
             order.discount_amount = discount_amount
         return func(*args, **kwargs)
 
@@ -153,16 +155,23 @@ def recalculate_order_weight(order):
 
 def update_order_prices(order, discounts):
     """Update prices in order with given discounts and proper taxes."""
-    taxes = get_taxes_for_address(order.shipping_address)
-
+    manager = get_extensions_manager()
     for line in order:
         if line.variant:
-            line.unit_price = line.variant.get_price(discounts, taxes)
-            line.tax_rate = get_tax_rate_by_name(line.variant.product.tax_rate, taxes)
-            line.save()
+            unit_price = line.variant.get_price(discounts)
+            line.unit_price_net = unit_price
+            line.unit_price_gross = unit_price
+            line.save(update_fields=["unit_price_net", "unit_price_gross"])
+
+            price = manager.calculate_order_line_unit(line)
+            if price != line.unit_price:
+                line.unit_price = price
+                if price.tax and price.net:
+                    line.tax_rate = price.tax / price.net
+                line.save()
 
     if order.shipping_method:
-        order.shipping_price = order.shipping_method.get_total(taxes)
+        order.shipping_price = manager.calculate_order_shipping(order)
         order.save()
 
     recalculate_order(order)
@@ -190,6 +199,8 @@ def cancel_order(user, order, restock):
     payments = order.payments.filter(is_active=True).exclude(
         charge_status=ChargeStatus.FULLY_REFUNDED
     )
+
+    from ..payment.utils import gateway_refund, gateway_void
 
     for payment in payments:
         if payment.can_refund():
@@ -252,7 +263,6 @@ def add_variant_to_order(
     variant,
     quantity,
     discounts=None,
-    taxes=None,
     allow_overselling=False,
     track_inventory=True,
 ):
@@ -271,6 +281,7 @@ def add_variant_to_order(
         line.quantity += quantity
         line.save(update_fields=["quantity"])
     except OrderLine.DoesNotExist:
+        unit_price = variant.get_price(discounts)
         product_name = variant.display_product()
         translated_product_name = variant.display_product(translated=True)
         if translated_product_name == product_name:
@@ -281,10 +292,16 @@ def add_variant_to_order(
             product_sku=variant.sku,
             is_shipping_required=variant.is_shipping_required(),
             quantity=quantity,
+            unit_price_net=unit_price,
+            unit_price_gross=unit_price,
             variant=variant,
-            unit_price=variant.get_price(discounts, taxes),
-            tax_rate=get_tax_rate_by_name(variant.product.tax_rate, taxes),
         )
+        manager = get_extensions_manager()
+        unit_price = manager.calculate_order_line_unit(line)
+        line.unit_price_net = unit_price.net
+        line.unit_price_gross = unit_price.gross
+        line.tax_rate = unit_price.tax / unit_price.net
+        line.save(update_fields=["unit_price_net", "unit_price_gross", "tax_rate"])
 
     if variant.track_inventory and track_inventory:
         allocate_stock(variant, quantity)
@@ -296,11 +313,11 @@ def add_gift_card_to_order(order, gift_card, total_price_left):
 
     Return a total price left after applying the gift cards.
     """
-    if total_price_left > ZERO_MONEY:
+    if total_price_left > zero_money(total_price_left.currency):
         order.gift_cards.add(gift_card)
         if total_price_left < gift_card.current_balance:
             gift_card.current_balance = gift_card.current_balance - total_price_left
-            total_price_left = ZERO_MONEY
+            total_price_left = zero_money(total_price_left.currency)
         else:
             total_price_left = total_price_left - gift_card.current_balance
             gift_card.current_balance = 0
@@ -360,3 +377,9 @@ def sum_order_totals(qs):
     zero = Money(0, currency=settings.DEFAULT_CURRENCY)
     taxed_zero = TaxedMoney(zero, zero)
     return sum([order.total for order in qs], taxed_zero)
+
+
+def get_valid_shipping_methods_for_order(order: Order):
+    return ShippingMethod.objects.applicable_shipping_methods_for_instance(
+        order, price=order.get_subtotal().gross
+    )
